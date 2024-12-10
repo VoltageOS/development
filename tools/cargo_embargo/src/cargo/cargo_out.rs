@@ -20,12 +20,12 @@ use anyhow::bail;
 use anyhow::Context;
 use anyhow::Result;
 use log::debug;
-use once_cell::sync::Lazy;
 use regex::Regex;
 use std::collections::BTreeMap;
 use std::env;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::LazyLock;
 
 /// Reads the given `cargo.out` and `cargo.metadata` files, and generates a list of crates based on
 /// the rustc invocations.
@@ -56,9 +56,14 @@ fn parse_cargo_out_str(
     assert!(cargo_out.cc_invocations.is_empty(), "cc not supported yet");
     assert!(cargo_out.ar_invocations.is_empty(), "ar not supported yet");
 
+    let mut raw_names = BTreeMap::new();
+    for rustc in cargo_out.rustc_invocations.iter() {
+        raw_name_from_rustc_invocation(rustc, &mut raw_names)
+    }
+
     let mut crates = Vec::new();
     for rustc in cargo_out.rustc_invocations.iter() {
-        let c = Crate::from_rustc_invocation(rustc, metadata, &cargo_out.tests)
+        let c = Crate::from_rustc_invocation(rustc, metadata, &cargo_out.tests, &raw_names)
             .with_context(|| format!("failed to process rustc invocation: {rustc}"))?;
         // Ignore build.rs crates.
         if c.name.starts_with("build_script_") {
@@ -72,6 +77,61 @@ fn parse_cargo_out_str(
     }
     crates.dedup();
     Ok(crates)
+}
+
+fn args_from_rustc_invocation(rustc: &str) -> Vec<&str> {
+    let mut args = Vec::new();
+    let mut chars = rustc.char_indices();
+    while let Some((start, c)) = chars.next() {
+        match c {
+            '\'' => {
+                let (end, _) =
+                    chars.find(|(_, c)| *c == '\'').expect("Missing closing single quote");
+                args.push(&rustc[start + 1..end]);
+            }
+            '"' => {
+                let (end, _) =
+                    chars.find(|(_, c)| *c == '"').expect("Missing closing double quote");
+                args.push(&rustc[start + 1..end]);
+            }
+            _ => {
+                if c.is_ascii_whitespace() {
+                    // Ignore, continue on to the next character.
+                } else if let Some((end, _)) = chars.find(|(_, c)| c.is_ascii_whitespace()) {
+                    args.push(&rustc[start..end]);
+                } else {
+                    args.push(&rustc[start..]);
+                }
+            }
+        }
+    }
+    args
+}
+
+/// Parse out the path name for a crate from a rustc invocation
+fn raw_name_from_rustc_invocation(rustc: &str, raw_names: &mut BTreeMap<String, String>) {
+    let mut crate_name = String::new();
+    // split into args
+    let mut arg_iter = args_from_rustc_invocation(rustc).into_iter();
+    // look for the crate name and a string ending in .rs and check whether the
+    // path string contains a kebab-case version of the crate name
+    while let Some(arg) = arg_iter.next() {
+        match arg {
+            "--crate-name" => crate_name = arg_iter.next().unwrap().to_string(),
+            _ if arg.ends_with(".rs") => {
+                assert_ne!(crate_name, "", "--crate-name option should precede input");
+                let snake_case_arg = arg.replace('-', "_");
+                if let Some(idx) = snake_case_arg.rfind(&crate_name) {
+                    let raw_name = arg[idx..idx + crate_name.len()].to_string();
+                    if crate_name != raw_name {
+                        raw_names.insert(crate_name, raw_name);
+                    }
+                }
+                break;
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Whether a test target contains any tests or benchmarks.
@@ -129,16 +189,16 @@ impl CargoOut {
             }
 
             // Cargo -v output of a call to rustc.
-            static RUSTC_REGEX: Lazy<Regex> =
-                Lazy::new(|| Regex::new(r"^ +Running `rustc (.*)`$").unwrap());
+            static RUSTC_REGEX: LazyLock<Regex> =
+                LazyLock::new(|| Regex::new(r"^ +Running `(?:/[^\s]*/)?rustc (.*)`$").unwrap());
             if let Some(args) = match1(&RUSTC_REGEX, line) {
                 result.rustc_invocations.push(args);
                 continue;
             }
             // Cargo -vv output of a call to rustc could be split into multiple lines.
             // Assume that the first line will contain some CARGO_* env definition.
-            static RUSTC_VV_REGEX: Lazy<Regex> =
-                Lazy::new(|| Regex::new(r"^ +Running `.*CARGO_.*=.*$").unwrap());
+            static RUSTC_VV_REGEX: LazyLock<Regex> =
+                LazyLock::new(|| Regex::new(r"^ +Running `.*CARGO_.*=.*$").unwrap());
             if RUSTC_VV_REGEX.is_match(line) {
                 // cargo build -vv output can have multiple lines for a rustc command due to
                 // '\n' in strings for environment variables.
@@ -155,8 +215,9 @@ impl CargoOut {
                     break;
                 }
                 // The combined -vv output rustc command line pattern.
-                static RUSTC_VV_CMD_ARGS: Lazy<Regex> =
-                    Lazy::new(|| Regex::new(r"^ *Running `.*CARGO_.*=.* rustc (.*)`$").unwrap());
+                static RUSTC_VV_CMD_ARGS: LazyLock<Regex> = LazyLock::new(|| {
+                    Regex::new(r"^ *Running `.*CARGO_.*=.* (?:/[^\s]*/)?rustc (.*)`$").unwrap()
+                });
                 if let Some(args) = match1(&RUSTC_VV_CMD_ARGS, &line) {
                     result.rustc_invocations.push(args);
                 } else {
@@ -165,8 +226,8 @@ impl CargoOut {
                 continue;
             }
             // Cargo -vv output of a "cc" or "ar" command; all in one line.
-            static CC_AR_VV_REGEX: Lazy<Regex> = Lazy::new(|| {
-                Regex::new(r#"^\[([^ ]*)[^\]]*\] running:? "(cc|ar)" (.*)$"#).unwrap()
+            static CC_AR_VV_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+                Regex::new(r#"^\[([^ ]*)[^\]]*\] running:? "(?:/[^\s]*/)?(cc|ar)" (.*)$"#).unwrap()
             });
             if let Some((pkg, cmd, args)) = match3(&CC_AR_VV_REGEX, line) {
                 match cmd.as_str() {
@@ -177,8 +238,8 @@ impl CargoOut {
                 continue;
             }
             // Rustc output of file location path pattern for a warning message.
-            static WARNING_FILE_REGEX: Lazy<Regex> =
-                Lazy::new(|| Regex::new(r"^ *--> ([^:]*):[0-9]+").unwrap());
+            static WARNING_FILE_REGEX: LazyLock<Regex> =
+                LazyLock::new(|| Regex::new(r"^ *--> ([^:]*):[0-9]+").unwrap());
             if result.warning_lines.contains_key(&n.saturating_sub(1)) {
                 if let Some(fpath) = match1(&WARNING_FILE_REGEX, line) {
                     result.warning_files.push(fpath);
@@ -193,8 +254,8 @@ impl CargoOut {
                 }
                 continue;
             }
-            static CARGO2ANDROID_RUNNING_REGEX: Lazy<Regex> =
-                Lazy::new(|| Regex::new(r"^### Running: .*$").unwrap());
+            static CARGO2ANDROID_RUNNING_REGEX: LazyLock<Regex> =
+                LazyLock::new(|| Regex::new(r"^### Running: .*$").unwrap());
             if CARGO2ANDROID_RUNNING_REGEX.is_match(line) {
                 in_tests = line.contains("cargo test") && line.contains("--list");
                 continue;
@@ -202,10 +263,11 @@ impl CargoOut {
 
             // `cargo test -- --list` output
             // Example: Running unittests src/lib.rs (target.tmp/x86_64-unknown-linux-gnu/debug/deps/aarch64-58b675be7dc09833)
-            static CARGO_TEST_LIST_START_PAT: Lazy<Regex> =
-                Lazy::new(|| Regex::new(r"^\s*Running (?:unittests )?(.*) \(.*/(.*)\)$").unwrap());
-            static CARGO_TEST_LIST_END_PAT: Lazy<Regex> =
-                Lazy::new(|| Regex::new(r"^(\d+) tests?, (\d+) benchmarks$").unwrap());
+            static CARGO_TEST_LIST_START_PAT: LazyLock<Regex> = LazyLock::new(|| {
+                Regex::new(r"^\s*Running (?:unittests )?(.*) \(.*/(.*)\)$").unwrap()
+            });
+            static CARGO_TEST_LIST_END_PAT: LazyLock<Regex> =
+                LazyLock::new(|| Regex::new(r"^(\d+) tests?, (\d+) benchmarks$").unwrap());
             if let Some(captures) = CARGO_TEST_LIST_START_PAT.captures(line) {
                 cur_test_key =
                     Some((captures.get(2).unwrap().as_str(), captures.get(1).unwrap().as_str()));
@@ -233,22 +295,13 @@ impl Crate {
         rustc: &str,
         metadata: &WorkspaceMetadata,
         tests: &BTreeMap<String, BTreeMap<PathBuf, TestContents>>,
+        raw_names: &BTreeMap<String, String>,
     ) -> Result<Crate> {
         let mut out = Crate::default();
         let mut extra_filename = String::new();
 
         // split into args
-        let args: Vec<&str> = rustc.split_whitespace().collect();
-        let mut arg_iter = args
-            .iter()
-            // Remove quotes from simple strings, panic for others.
-            .map(|arg| match (arg.chars().next(), arg.chars().skip(1).last()) {
-                (Some('"'), Some('"')) => &arg[1..arg.len() - 1],
-                (Some('\''), Some('\'')) => &arg[1..arg.len() - 1],
-                (Some('"'), _) => panic!("can't handle strings with whitespace"),
-                (Some('\''), _) => panic!("can't handle strings with whitespace"),
-                _ => arg,
-            });
+        let mut arg_iter = args_from_rustc_invocation(rustc).into_iter();
         // process each arg
         while let Some(arg) = arg_iter.next() {
             match arg {
@@ -277,7 +330,7 @@ impl Crate {
                         let filename = path.split('/').last().unwrap();
 
                         // Example filename: "libgetrandom-fd8800939535fc59.rmeta" or "libmls_rs_uniffi.rlib".
-                        static REGEX: Lazy<Regex> = Lazy::new(|| {
+                        static REGEX: LazyLock<Regex> = LazyLock::new(|| {
                             Regex::new(r"^lib([^-]*)(?:-[0-9a-f]*)?.(rlib|so|rmeta)$").unwrap()
                         });
 
@@ -293,9 +346,17 @@ impl Crate {
                             } else {
                                 bail!("Unexpected extension for extern filename {}", filename);
                             };
+
+                        let lib_name = lib_name.as_str().to_string();
+                        let raw_name = if let Some(raw_name) = raw_names.get(&lib_name) {
+                            raw_name.to_owned()
+                        } else {
+                            lib_name.clone()
+                        };
                         out.externs.push(Extern {
                             name: name.to_string(),
-                            lib_name: lib_name.as_str().to_string(),
+                            lib_name,
+                            raw_name,
                             extern_type,
                         });
                     } else if arg != "proc_macro" {
@@ -351,6 +412,9 @@ impl Crate {
                     arg_iter.next().unwrap();
                 }
                 "--color" => {
+                    arg_iter.next().unwrap();
+                }
+                "--check-cfg" => {
                     arg_iter.next().unwrap();
                 }
                 _ if arg.starts_with("--error-format=") => {}
@@ -413,6 +477,8 @@ impl Crate {
         out.package_name.clone_from(&package_metadata.name);
         out.version = Some(package_metadata.version.clone());
         out.edition.clone_from(&package_metadata.edition);
+        out.license.clone_from(&package_metadata.license);
+        out.license_file.clone_from(&package_metadata.license_file);
 
         let output_filename = out.name.clone() + &extra_filename;
         if let Some(test_contents) = tests.get(&output_filename).and_then(|m| m.get(&out.main_src))
@@ -454,4 +520,20 @@ fn find_cargo_toml(src_path: &Path) -> Result<PathBuf> {
             .ok_or_else(|| anyhow!("No Cargo.toml found in parents of {:?}", src_path))?;
     }
     Ok(package_dir.to_path_buf())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_args() {
+        assert_eq!(args_from_rustc_invocation("foo bar"), vec!["foo", "bar"]);
+        assert_eq!(args_from_rustc_invocation("  foo   bar "), vec!["foo", "bar"]);
+        assert_eq!(args_from_rustc_invocation("'foo' \"bar\""), vec!["foo", "bar"]);
+        assert_eq!(
+            args_from_rustc_invocation("'fo o' \" b ar\" ' baz '"),
+            vec!["fo o", " b ar", " baz "]
+        );
+    }
 }
